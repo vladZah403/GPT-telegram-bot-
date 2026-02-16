@@ -15,7 +15,7 @@ logging.basicConfig(
 )
 
 # ===== Настройки бота =====
-BOT_TOKEN = "8094757760:AAHRKESZHJFrDNtAVcWvf56N3FKu0ZSfFmA"
+BOT_TOKEN = ""
 bot = telebot.TeleBot(BOT_TOKEN)
 client = Client()
 
