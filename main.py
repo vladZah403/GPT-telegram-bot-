@@ -6,6 +6,7 @@ from io import BytesIO
 import threading
 import logging
 import base64
+import re  # Додано для очищення промптів
 
 # ===== Настройка логирования =====
 logging.basicConfig(
@@ -26,25 +27,26 @@ commands = [
     telebot.types.BotCommand("/image_model", "Выбрать модель для генерации изображений"),
     telebot.types.BotCommand("/image_settings", "Настройки генерации изображений"),
     telebot.types.BotCommand("/image", "Сгенерировать изображение по описанию"),
+    telebot.types.BotCommand("/image_raw", "Сгенерировать без автоматического улучшения промпта"),
     telebot.types.BotCommand("/analyze", "Анализировать изображение")
 ]
 bot.set_my_commands(commands)
 
 # ===== Модели и пользователи =====
-DEFAULT_MODEL = "gpt-4o-mini"
+DEFAULT_MODEL = "gpt-4"
 DEFAULT_IMAGE_MODEL = "flux"
-VISION_MODEL = "gpt-4o"
+VISION_MODEL = "gpt-4"
 
-user_models = {}  # Модели для текста
-user_image_models = {}  # Модели для изображений
-user_image_settings = {}  # Настройки генерации изображений
+user_models = {}
+user_image_models = {}
+user_image_settings = {}
 user_waiting_for_image = {}
 
 # Доступные текстовые модели
 AVAILABLE_MODELS = {
     "GPT-4.1": "gpt-4.1",
     "GPT-4o": "gpt-4o",
-    "GPT-4": "gpt-4",
+    "GPT-4 (Рекомендуется) ": "gpt-4",
     "GPT-4o-mini": "gpt-4o-mini",
     "DeepSeek V3": "deepseek-v3"
 }
@@ -94,6 +96,155 @@ IMAGE_MODEL_SETTINGS = {
     }
 }
 
+# ========== ПОКРАЩЕННЯ ПРОМПТІВ ==========
+
+# 1️⃣ Словники для автоматичного визначення контексту
+
+TOPIC_KEYWORDS = {
+    "nature": "lush vegetation, realistic textures, depth of field",
+    "city": "urban landscape, detailed architecture, bustling atmosphere",
+    "portrait": "professional portrait, sharp focus on face, natural skin texture",
+    "fantasy": "magical atmosphere, ethereal, otherworldly",
+    "sci-fi": "futuristic, high-tech, sleek design",
+    "food": "appetizing, vibrant colors, soft lighting, macro shot",
+    "animal": "detailed fur/feathers, realistic anatomy, dynamic pose",
+    "space": "cosmic, stars, nebula, galaxy, deep space",
+    "underwater": "underwater scene, coral reef, marine life, light rays",
+    "steampunk": "steampunk aesthetic, brass gears, Victorian, industrial",
+    "cyberpunk": "cyberpunk, neon lights, rainy, high contrast, futuristic city",
+    "anime": "anime style, cel-shaded, vibrant colors, Japanese animation",
+    "watercolor": "watercolor painting, soft edges, artistic, textured paper",
+    "oil painting": "oil painting, thick brush strokes, impasto, canvas texture",
+    "minimalist": "minimalist, simple background, clean lines, less is more"
+}
+
+STYLE_KEYWORDS = {
+    "anime": "anime style, cel-shaded, vibrant colors, Japanese animation",
+    "watercolor": "watercolor painting, soft edges, artistic, textured paper",
+    "oil painting": "oil painting, thick brush strokes, impasto, canvas texture",
+    "cyberpunk": "cyberpunk aesthetic, neon lights, rainy, high contrast",
+    "steampunk": "steampunk style, brass gears, Victorian, industrial",
+    "minimalist": "minimalist, simple background, clean lines, less is more",
+    "photorealistic": "photorealistic, hyper-realistic, DSLR, 8k, highly detailed",
+    "cartoon": "cartoon style, vibrant, exaggerated features",
+    "3d render": "3D render, octane render, blender, c4d, detailed textures"
+}
+
+LIGHTING_KEYWORDS = {
+    "cinematic": "cinematic lighting, volumetric light, moody atmosphere",
+    "golden hour": "golden hour, warm sunlight, long shadows, sunset glow",
+    "studio": "studio lighting, softbox, well-lit, no harsh shadows",
+    "neon": "neon lighting, vibrant glow, dark background, reflective surfaces",
+    "dramatic": "dramatic lighting, chiaroscuro, high contrast, spotlight",
+    "natural": "natural lighting, soft diffused light, daylight",
+    "moody": "moody atmosphere, dim light, shadows, mysterious"
+}
+
+COMPOSITION_KEYWORDS = {
+    "close-up": "close-up shot, detailed, shallow depth of field, macro",
+    "wide": "wide angle, panoramic, expansive view, landscape",
+    "aerial": "aerial view, drone shot, bird's eye perspective, top-down",
+    "low angle": "low angle shot, dramatic perspective, heroic, upward view",
+    "portrait": "portrait composition, rule of thirds, centered subject",
+    "symmetrical": "symmetrical composition, balanced, geometric"
+}
+
+# 2️⃣ Модель-специфічні бустери якості
+MODEL_QUALITY_BOOST = {
+    "flux": "8k, photorealistic, ultra-detailed, sharp focus, volumetric lighting, HDR",
+    "dalle-3": "high quality, detailed, vibrant colors, natural lighting, professional",
+    "sdxl": "masterpiece, best quality, highly detailed, intricate details, award-winning",
+    "playground-v2.5": "professional, detailed, 8k, artistic, creative composition",
+    "midjourney": "award winning, stunning, intricate details, breathtaking --ar 16:9 --style expressive"
+}
+
+
+# 3️⃣ Функції визначення категорій
+def detect_topic(prompt):
+    prompt_lower = prompt.lower()
+    detected = []
+    for topic, keywords in TOPIC_KEYWORDS.items():
+        if topic in prompt_lower:
+            detected.append(keywords)
+    return ", ".join(detected) if detected else ""
+
+
+def detect_style(prompt):
+    prompt_lower = prompt.lower()
+    detected = []
+    for style, keywords in STYLE_KEYWORDS.items():
+        if style in prompt_lower:
+            detected.append(keywords)
+    return ", ".join(detected) if detected else ""
+
+
+def detect_lighting(prompt):
+    prompt_lower = prompt.lower()
+    detected = []
+    for lighting, keywords in LIGHTING_KEYWORDS.items():
+        if lighting in prompt_lower:
+            detected.append(keywords)
+    return ", ".join(detected) if detected else ""
+
+
+def detect_composition(prompt):
+    prompt_lower = prompt.lower()
+    detected = []
+    for comp, keywords in COMPOSITION_KEYWORDS.items():
+        if comp in prompt_lower:
+            detected.append(keywords)
+    return ", ".join(detected) if detected else ""
+
+
+def clean_prompt(prompt):
+    """Видаляє зайві коми, пробіли, крапки."""
+    prompt = re.sub(r',+', ',', prompt)
+    prompt = re.sub(r'\s+,', ',', prompt)
+    prompt = re.sub(r',\s+', ', ', prompt)
+    prompt = re.sub(r'\.+', '.', prompt)
+    return prompt.strip().strip(',').strip()
+
+
+def improve_prompt(user_prompt, model):
+    """
+    Головна функція покращення промпта.
+    Визначає тему, стиль, освітлення, композицію та додає модель-специфічний буст.
+    """
+    user_prompt = user_prompt.strip().rstrip(',.')
+
+    # 1. Визначаємо категорії
+    topics = detect_topic(user_prompt)
+    style = detect_style(user_prompt)
+    lighting = detect_lighting(user_prompt)
+    composition = detect_composition(user_prompt)
+
+    # 2. Базові дескриптори (якщо щось не знайдено – додаємо розумне замовчування)
+    if not lighting:
+        lighting = LIGHTING_KEYWORDS.get("cinematic", "cinematic lighting")
+    if not composition:
+        composition = COMPOSITION_KEYWORDS.get("wide", "professional composition, rule of thirds")
+
+    # 3. Збираємо фінальний промпт
+    enhanced_parts = [user_prompt]
+    if topics:
+        enhanced_parts.append(topics)
+    if style:
+        enhanced_parts.append(style)
+    if lighting:
+        enhanced_parts.append(lighting)
+    if composition:
+        enhanced_parts.append(composition)
+
+    # 4. Додаємо модель-специфічний буст
+    quality_boost = MODEL_QUALITY_BOOST.get(model, "high quality, detailed")
+    enhanced_parts.append(quality_boost)
+
+    # 5. Об'єднуємо через кому та очищаємо
+    final_prompt = ", ".join(enhanced_parts)
+    final_prompt = clean_prompt(final_prompt)
+
+    return final_prompt
+
 
 # ===== КОМАНДА START =====
 @bot.message_handler(commands=['start'])
@@ -103,7 +254,7 @@ def start(message):
         f"👋 Привет, {message.from_user.first_name}!\n\n"
         "🤖 Я многофункциональный ИИ-бот с поддержкой:\n"
         "✨ Генерации текста (несколько моделей)\n"
-        "🎨 Генерации изображений (5 моделей)\n"
+        "🎨 Генерации изображений (5 моделей, автоматическое улучшение промптов)\n"
         "🔍 Анализа изображений\n\n"
         "📖 Используй /help для просмотра всех команд и возможностей!"
     )
@@ -197,7 +348,6 @@ def image_settings_command(message):
 
     keyboard = types.InlineKeyboardMarkup()
 
-    # Размеры
     sizes = ["1024x1024", "1024x1792", "1792x1024", "512x512"]
     for size in sizes:
         button_text = f"✅ {size}" if size == current_size else f"📐 {size}"
@@ -237,58 +387,22 @@ def set_image_size(call):
     )
 
 
-# ===== ФУНКЦИЯ УЛУЧШЕНИЯ ПРОМПТА =====
-def improve_prompt(user_prompt, model):
-    """
-    Автоматично покращує промпт для генерації зображень,
-    враховуючи контекст, модель та стандартні рекомендації.
-    """
-    user_prompt = user_prompt.strip().rstrip(',.')
-
-    # 1. Визначаємо базові категорії
-    topics = detect_topics(user_prompt)
-    style = detect_style(user_prompt)
-    lighting = detect_lighting(user_prompt) or "cinematic"
-    composition = detect_composition(user_prompt) or "professional composition"
-
-    # 2. Якісні дескриптори для кожної моделі
-    quality_boost = {
-        "flux": "8k, photorealistic, ultra-detailed, sharp focus, volumetric lighting",
-        "dalle-3": "high quality, detailed, vibrant colors, natural lighting",
-        "sdxl": "masterpiece, best quality, highly detailed, intricate details",
-        "playground-v2.5": "professional, detailed, 8k, artistic",
-        "midjourney": "award winning, stunning, intricate details --ar 16:9"
-    }
-
-    # 3. Збираємо фінальний промпт
-    final_prompt = user_prompt
-
-    if topics:
-        final_prompt += f", {topics}"
-    if style:
-        final_prompt += f", {style}"
-    if lighting:
-        final_prompt += f", {lighting} lighting"
-    if composition:
-        final_prompt += f", {composition}"
-
-    # Додаємо якісний буст для конкретної моделі
-    final_prompt += f", {quality_boost.get(model, 'high quality, detailed')}"
-
-    # 4. Пост-обробка (видаляємо зайві коми, пробіли)
-    final_prompt = re.sub(r',+', ',', final_prompt)
-    final_prompt = re.sub(r'\s+,', ',', final_prompt)
-
-    return final_prompt
-
 # ===== ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ =====
-def generate_image_thread(message):
-    prompt = message.text.replace("/image", "").strip()
+def generate_image_thread(message, raw_mode=False):
+    # Видаляємо команду /image або /image_raw
+    prompt = message.text.replace("/image", "").replace("/image_raw", "").strip()
+
+    # Перевіряємо, чи користувач додав --raw в кінці (навіть для /image)
+    if prompt.endswith("--raw"):
+        raw_mode = True
+        prompt = prompt.replace("--raw", "").strip()
+
     if not prompt:
         bot.reply_to(
             message,
-            "❌ Напиши описание после команды /image\n\n"
-            "📝 Пример: `/image красивый закат на море`\n\n"
+            "❌ Напиши описание после команды\n\n"
+            "📝 Пример: `/image красивый закат на море`\n"
+            "📝 Пример без улучшений: `/image_raw sunset` або `/image sunset --raw`\n\n"
             "💡 *Советы для лучшего результата:*\n"
             "• Используй описательные прилагательные\n"
             "• Укажи стиль (реалистичный, аниме, акварель)\n"
@@ -298,7 +412,7 @@ def generate_image_thread(message):
             "`/image a serene mountain landscape at sunset, photorealistic`\n"
             "`/image anime girl with blue hair, studio ghibli style`\n"
             "`/image futuristic city with neon lights, cyberpunk`",
-            parse_mode="Markdown"
+            parse_mode= None
         )
         return
 
@@ -306,78 +420,71 @@ def generate_image_thread(message):
     model = user_image_models.get(user_id, DEFAULT_IMAGE_MODEL)
     settings = IMAGE_MODEL_SETTINGS.get(model, IMAGE_MODEL_SETTINGS["flux"])
 
-    # Получаем пользовательские настройки размера
     user_size = user_image_settings.get(user_id, {}).get('size', settings.get('default_size', '1024x1024'))
 
-    # Улучшаем промпт
-    improved_prompt = improve_prompt(prompt, model)
+    # --- ПОКРАЩЕННЯ ПРОМПТУ ---
+    if raw_mode:
+        final_prompt = prompt
+        logging.info(f"Raw mode: промпт без изменений: {final_prompt}")
+    else:
+        final_prompt = improve_prompt(prompt, model)
+        logging.info(f"Оригинальный промпт: {prompt}")
+        logging.info(f"Улучшенный промпт: {final_prompt}")
 
     status_msg = bot.send_message(
         message.chat.id,
         f"🎨 Генерирую изображение...\n"
         f"📷 Модель: *{settings['name']}*\n"
         f"📐 Размер: *{user_size}*\n"
-        f"✨ Оптимизирую запрос для лучшего качества...",
+        f"✨ {'Промпт улучшен' if not raw_mode else 'Без улучшений'}...",
         parse_mode="Markdown"
     )
     bot.send_chat_action(message.chat.id, "upload_photo")
 
     try:
-        logging.info(f"Генерация с моделью: {model}")
-        logging.info(f"Оригинальный промпт: {prompt}")
-        logging.info(f"Улучшенный промпт: {improved_prompt}")
-
-        # Параметры для генерации
         generation_params = {
             "model": model,
-            "prompt": improved_prompt,
+            "prompt": final_prompt,
             "response_format": "url"
         }
 
-        # Добавляем размер если поддерживается
         if settings.get("supports_size"):
             generation_params["size"] = user_size
-
-        # Добавляем качество если поддерживается
         if settings.get("supports_quality"):
             generation_params["quality"] = settings.get("quality", "hd")
 
+        # Тут можна додати negative_prompt, якщо модель підтримує
+        # generation_params["negative_prompt"] = "ugly, deformed, blurry, low quality"
+
         logging.info(f"Параметры генерации: {generation_params}")
 
-        # Генерируем изображение
         response = client.images.generate(**generation_params)
-
-        # Получаем URL изображения
         image_url = response.data[0].url
         logging.info(f"Image URL: {image_url}")
 
-        # Обновляем статус
         bot.edit_message_text(
             f"🎨 Генерация завершена!\n📥 Скачиваю изображение...",
             message.chat.id,
             status_msg.message_id
         )
 
-        # Скачиваем изображение
         img_response = requests.get(image_url, timeout=60)
         img_response.raise_for_status()
         image_bytes = BytesIO(img_response.content)
         image_bytes.name = "image.png"
 
-        # Удаляем статусное сообщение
         bot.delete_message(message.chat.id, status_msg.message_id)
 
-        # Формируем подпись
         caption = (
             f"🎨 *Промпт:* {prompt}\n"
             f"📷 *Модель:* {settings['name']}\n"
             f"📐 *Размер:* {generation_params.get('size', 'авто')}"
         )
-
+        if not raw_mode:
+            caption += "\n✨ *Автоулучшение:* включено"
         if generation_params.get('quality'):
             caption += f"\n💎 *Качество:* {generation_params['quality']}"
 
-        # Отправляем изображение
         bot.send_photo(
             message.chat.id,
             image_bytes,
@@ -385,10 +492,10 @@ def generate_image_thread(message):
             parse_mode="Markdown"
         )
 
-        # Предлагаем варианты действий
+        # Кнопки действий
         keyboard = types.InlineKeyboardMarkup()
         keyboard.row(
-            types.InlineKeyboardButton("🔄 Регенерировать", callback_data=f"regen:{prompt}"),
+            types.InlineKeyboardButton("🔄 Регенерировать", callback_data=f"regen:{prompt}:{raw_mode}"),
             types.InlineKeyboardButton("✏️ Изменить промпт", callback_data="edit_prompt")
         )
         keyboard.row(
@@ -402,8 +509,7 @@ def generate_image_thread(message):
 
     except Exception as e:
         logging.error(f"Ошибка генерации изображения ({model}): {e}")
-
-        # Пробуем запасные модели
+        # ... (тут залишаємо твою логіку fallback, вона не змінилась)
         fallback_models = ["flux", "dalle-3", "sdxl", "playground-v2.5"]
         fallback_models = [m for m in fallback_models if m != model]
 
@@ -419,18 +525,19 @@ def generate_image_thread(message):
                     status_msg.message_id
                 )
 
-                # Улучшаем промпт для новой модели
-                fallback_prompt = improve_prompt(prompt, fallback)
+                # Для fallback теж застосовуємо покращення, якщо не raw_mode
+                if raw_mode:
+                    fallback_prompt = prompt
+                else:
+                    fallback_prompt = improve_prompt(prompt, fallback)
 
                 fallback_params = {
                     "model": fallback,
                     "prompt": fallback_prompt,
                     "response_format": "url"
                 }
-
                 if fallback_settings.get("supports_size"):
                     fallback_params["size"] = user_size
-
                 if fallback_settings.get("supports_quality"):
                     fallback_params["quality"] = fallback_settings.get("quality")
 
@@ -449,6 +556,8 @@ def generate_image_thread(message):
                     f"📷 *Модель:* {fallback_settings['name']} (запасная)\n"
                     f"📐 *Размер:* {fallback_params.get('size', 'авто')}"
                 )
+                if not raw_mode:
+                    caption += "\n✨ *Автоулучшение:* включено"
 
                 bot.send_photo(
                     message.chat.id,
@@ -457,10 +566,9 @@ def generate_image_thread(message):
                     parse_mode="Markdown"
                 )
 
-                # Добавляем кнопки действий
                 keyboard = types.InlineKeyboardMarkup()
                 keyboard.row(
-                    types.InlineKeyboardButton("🔄 Регенерировать", callback_data=f"regen:{prompt}"),
+                    types.InlineKeyboardButton("🔄 Регенерировать", callback_data=f"regen:{prompt}:{raw_mode}"),
                     types.InlineKeyboardButton("🎨 Сменить модель", callback_data="quick_model_change")
                 )
                 bot.send_message(
@@ -492,16 +600,27 @@ def generate_image_thread(message):
 
 @bot.message_handler(commands=['image'])
 def handle_image(message):
-    threading.Thread(target=generate_image_thread, args=(message,), daemon=True).start()
+    threading.Thread(target=generate_image_thread, args=(message, False), daemon=True).start()
+
+
+@bot.message_handler(commands=['image_raw'])
+def handle_image_raw(message):
+    threading.Thread(target=generate_image_thread, args=(message, True), daemon=True).start()
 
 
 # ===== CALLBACK ДЛЯ РЕГЕНЕРАЦИИ =====
 @bot.callback_query_handler(func=lambda call: call.data.startswith("regen:"))
 def regenerate_image(call):
-    prompt = call.data.replace("regen:", "")
+    data = call.data.replace("regen:", "").split(":", 1)
+    if len(data) == 2:
+        prompt, raw_mode_str = data
+        raw_mode = raw_mode_str.lower() == "true"
+    else:
+        prompt = data[0]
+        raw_mode = False
+
     bot.answer_callback_query(call.id, "🔄 Регенерирую изображение...")
 
-    # Создаем фейковое сообщение для функции генерации
     class FakeMessage:
         def __init__(self, chat_id, text, user):
             self.chat = type('obj', (object,), {'id': chat_id})
@@ -509,7 +628,7 @@ def regenerate_image(call):
             self.from_user = user
 
     fake_msg = FakeMessage(call.message.chat.id, prompt, call.from_user)
-    threading.Thread(target=generate_image_thread, args=(fake_msg,), daemon=True).start()
+    threading.Thread(target=generate_image_thread, args=(fake_msg, raw_mode), daemon=True).start()
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "edit_prompt")
@@ -518,7 +637,7 @@ def edit_prompt_callback(call):
     bot.send_message(
         call.message.chat.id,
         "✏️ Отправь новое описание для генерации изображения:\n\n"
-        "Используй формат: `/image описание`",
+        "Используй формат: `/image описание` или `/image_raw описание`",
         parse_mode="Markdown"
     )
 
@@ -621,7 +740,6 @@ def analyze_image_thread(message, photo, user_prompt=None):
             )
 
 
-# ===== ОБРАБОТКА ФОТО =====
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message):
     user_id = message.from_user.id
@@ -708,7 +826,6 @@ def chat_thread(message):
         )
 
 
-# ===== ОБРАБОТКА ТЕКСТА =====
 @bot.message_handler(func=lambda message: not message.text.startswith("/"), content_types=['text'])
 def handle_text(message):
     threading.Thread(target=chat_thread, args=(message,), daemon=True).start()
@@ -749,7 +866,9 @@ def show_help(message):
 
 /image_model - выбрать модель для изображений
 /image_settings - настроить размер и качество
-/image <описание> - сгенерировать картинку
+/image <описание> - сгенерировать картинку (автоулучшение)
+/image_raw <описание> - сгенерировать без автоулучшения
+(также можно добавить `--raw` в конец обычного /image)
 
 *Доступные модели:*
 - Flux (рекомендуется) - высокое качество
@@ -766,8 +885,7 @@ def show_help(message):
 
 *Примеры:*
 `/image beautiful sunset over ocean`
-`/image anime girl with blue hair`
-`/image futuristic city cyberpunk style`
+`/image_raw beautiful sunset over ocean` (без улучшений)
 
 *💡 Советы для лучшего результата:*
 - Пиши на английском
@@ -806,6 +924,8 @@ def show_help(message):
 💡 *ДОПОЛНИТЕЛЬНЫЕ ВОЗМОЖНОСТИ*
 
 - Автоматическое улучшение промптов
+- Интеллектуальное определение темы, стиля, освещения, композиции
+- Режим "сырого" промпта (`--raw` или `/image_raw`)
 - Fallback на другие модели при ошибке
 - Кнопки быстрых действий
 - Регенерация изображений
@@ -815,7 +935,7 @@ def show_help(message):
 
 ❓ Есть вопросы? Просто напиши мне!
 """
-    bot.send_message(message.chat.id, help_text, parse_mode="Markdown")
+    bot.send_message(message.chat.id, help_text, parse_mode=None)
 
 
 # ===== ЗАПУСК БОТА =====
@@ -823,7 +943,7 @@ if __name__ == "__main__":
     logging.info("=" * 50)
     logging.info("🤖 Бот запущен и готов к работе!")
     logging.info("📋 Доступные команды загружены")
-    logging.info("✅ Все модули инициализированы")
+    logging.info("✅ Система улучшения промптов активирована")
     logging.info("=" * 50)
     try:
         bot.polling(none_stop=True, interval=0, timeout=20)
