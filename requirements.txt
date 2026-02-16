@@ -1,0 +1,14 @@
+# Telegram Bot API
+pyTelegramBotAPI==4.14.0
+
+# AI Models API
+g4f==0.1.9.9
+
+# HTTP requests
+requests==2.31.0
+
+# Environment variables
+python-dotenv==1.0.0
+
+# Optional: for better logging
+coloredlogs==15.0.1

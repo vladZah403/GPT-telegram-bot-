@@ -6,18 +6,28 @@ from io import BytesIO
 import threading
 import logging
 import base64
-import re  # Додано для очищення промптів
+import re
+import signal
+import sys
+
+# Импортируем конфигурацию
+from config import Config
 
 # ===== Настройка логирования =====
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, Config.LOG_LEVEL),
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
-# ===== Настройки бота =====
-BOT_TOKEN = ""
-bot = telebot.TeleBot(BOT_TOKEN)
-client = Client()
+# ===== Инициализация бота =====
+try:
+    bot = telebot.TeleBot(Config.BOT_TOKEN)
+    client = Client()
+    logging.info("✅ Бот успешно инициализирован")
+except Exception as e:
+    logging.error(f"❌ Ошибка инициализации бота: {e}")
+    sys.exit(1)
+
 
 # ===== Установка команд бота =====
 commands = [
@@ -28,77 +38,33 @@ commands = [
     telebot.types.BotCommand("/image_settings", "Настройки генерации изображений"),
     telebot.types.BotCommand("/image", "Сгенерировать изображение по описанию"),
     telebot.types.BotCommand("/image_raw", "Сгенерировать без автоматического улучшения промпта"),
-    telebot.types.BotCommand("/analyze", "Анализировать изображение")
+    telebot.types.BotCommand("/analyze", "Анализировать изображение"),
+    telebot.types.BotCommand("/stats", "Показать статистику использования")
 ]
 bot.set_my_commands(commands)
 
-# ===== Модели и пользователи =====
-DEFAULT_MODEL = "gpt-4"
-DEFAULT_IMAGE_MODEL = "flux"
-VISION_MODEL = "gpt-4"
-
+# ===== Пользовательские данные =====
 user_models = {}
 user_image_models = {}
 user_image_settings = {}
 user_waiting_for_image = {}
 
-# Доступные текстовые модели
-AVAILABLE_MODELS = {
-    "GPT-4.1": "gpt-4.1",
-    "GPT-4o": "gpt-4o",
-    "GPT-4 (Рекомендуется) ": "gpt-4",
-    "GPT-4o-mini": "gpt-4o-mini",
-    "DeepSeek V3": "deepseek-v3"
-}
+# Статистика использования
+from collections import defaultdict
 
-# Доступные модели для генерации изображений
-AVAILABLE_IMAGE_MODELS = {
-    "Flux (Рекомендуется)": "flux",
-    "DALL-E 3": "dalle-3",
-    "Stable Diffusion XL": "sdxl",
-    "Playground v2.5": "playground-v2.5",
-    "Midjourney": "midjourney"
-}
+user_stats = defaultdict(lambda: {
+    'messages': 0,
+    'images_generated': 0,
+    'images_analyzed': 0
+})
 
-# Настройки для разных моделей изображений
-IMAGE_MODEL_SETTINGS = {
-    "flux": {
-        "name": "Flux",
-        "supports_quality": True,
-        "supports_size": True,
-        "default_size": "1024x1024",
-        "quality": "hd"
-    },
-    "dalle-3": {
-        "name": "DALL-E 3",
-        "supports_quality": True,
-        "supports_size": True,
-        "default_size": "1024x1024",
-        "quality": "hd"
-    },
-    "sdxl": {
-        "name": "Stable Diffusion XL",
-        "supports_quality": False,
-        "supports_size": True,
-        "default_size": "1024x1024"
-    },
-    "playground-v2.5": {
-        "name": "Playground v2.5",
-        "supports_quality": False,
-        "supports_size": True,
-        "default_size": "1024x1024"
-    },
-    "midjourney": {
-        "name": "Midjourney",
-        "supports_quality": True,
-        "supports_size": True,
-        "default_size": "1024x1024"
-    }
-}
 
-# ========== ПОКРАЩЕННЯ ПРОМПТІВ ==========
+def update_stats(user_id, action):
+    """Обновление статистики пользователя"""
+    user_stats[user_id][action] += 1
 
-# 1️⃣ Словники для автоматичного визначення контексту
+
+# ========== УЛУЧШЕНИЕ ПРОМПТОВ ==========
 
 TOPIC_KEYWORDS = {
     "nature": "lush vegetation, realistic textures, depth of field",
@@ -149,7 +115,6 @@ COMPOSITION_KEYWORDS = {
     "symmetrical": "symmetrical composition, balanced, geometric"
 }
 
-# 2️⃣ Модель-специфічні бустери якості
 MODEL_QUALITY_BOOST = {
     "flux": "8k, photorealistic, ultra-detailed, sharp focus, volumetric lighting, HDR",
     "dalle-3": "high quality, detailed, vibrant colors, natural lighting, professional",
@@ -159,7 +124,6 @@ MODEL_QUALITY_BOOST = {
 }
 
 
-# 3️⃣ Функції визначення категорій
 def detect_topic(prompt):
     prompt_lower = prompt.lower()
     detected = []
@@ -197,7 +161,7 @@ def detect_composition(prompt):
 
 
 def clean_prompt(prompt):
-    """Видаляє зайві коми, пробіли, крапки."""
+    """Очистка промпта от лишних символов"""
     prompt = re.sub(r',+', ',', prompt)
     prompt = re.sub(r'\s+,', ',', prompt)
     prompt = re.sub(r',\s+', ', ', prompt)
@@ -206,25 +170,19 @@ def clean_prompt(prompt):
 
 
 def improve_prompt(user_prompt, model):
-    """
-    Головна функція покращення промпта.
-    Визначає тему, стиль, освітлення, композицію та додає модель-специфічний буст.
-    """
+    """Улучшение промпта для генерации изображений"""
     user_prompt = user_prompt.strip().rstrip(',.')
 
-    # 1. Визначаємо категорії
     topics = detect_topic(user_prompt)
     style = detect_style(user_prompt)
     lighting = detect_lighting(user_prompt)
     composition = detect_composition(user_prompt)
 
-    # 2. Базові дескриптори (якщо щось не знайдено – додаємо розумне замовчування)
     if not lighting:
         lighting = LIGHTING_KEYWORDS.get("cinematic", "cinematic lighting")
     if not composition:
         composition = COMPOSITION_KEYWORDS.get("wide", "professional composition, rule of thirds")
 
-    # 3. Збираємо фінальний промпт
     enhanced_parts = [user_prompt]
     if topics:
         enhanced_parts.append(topics)
@@ -235,11 +193,9 @@ def improve_prompt(user_prompt, model):
     if composition:
         enhanced_parts.append(composition)
 
-    # 4. Додаємо модель-специфічний буст
     quality_boost = MODEL_QUALITY_BOOST.get(model, "high quality, detailed")
     enhanced_parts.append(quality_boost)
 
-    # 5. Об'єднуємо через кому та очищаємо
     final_prompt = ", ".join(enhanced_parts)
     final_prompt = clean_prompt(final_prompt)
 
@@ -260,13 +216,30 @@ def start(message):
     )
 
 
+# ===== СТАТИСТИКА =====
+@bot.message_handler(commands=['stats'])
+def show_stats(message):
+    user_id = message.from_user.id
+    stats = user_stats.get(user_id, {'messages': 0, 'images_generated': 0, 'images_analyzed': 0})
+
+    bot.send_message(
+        message.chat.id,
+        f"📊 *Ваша статистика использования*\n\n"
+        f"💬 Сообщений отправлено: {stats['messages']}\n"
+        f"🎨 Изображений сгенерировано: {stats['images_generated']}\n"
+        f"🔍 Изображений проанализировано: {stats['images_analyzed']}\n\n"
+        f"Продолжай в том же духе! 🚀",
+        parse_mode="Markdown"
+    )
+
+
 # ===== ВЫБОР ТЕКСТОВОЙ МОДЕЛИ =====
 @bot.message_handler(commands=['model'])
 def choose_model(message):
     keyboard = types.InlineKeyboardMarkup()
-    current_model = user_models.get(message.from_user.id, DEFAULT_MODEL)
+    current_model = user_models.get(message.from_user.id, Config.DEFAULT_MODEL)
 
-    for name, model_id in AVAILABLE_MODELS.items():
+    for name, model_id in Config.AVAILABLE_MODELS.items():
         button_text = f"✅ {name}" if model_id == current_model else name
         keyboard.add(types.InlineKeyboardButton(
             text=button_text,
@@ -288,7 +261,7 @@ def set_model(call):
     model_id = call.data.split(":")[1]
     user_models[call.from_user.id] = model_id
 
-    model_name = next((name for name, mid in AVAILABLE_MODELS.items() if mid == model_id), model_id)
+    model_name = next((name for name, mid in Config.AVAILABLE_MODELS.items() if mid == model_id), model_id)
 
     bot.answer_callback_query(call.id, f"Модель выбрана: {model_name}")
     bot.edit_message_text(
@@ -303,9 +276,9 @@ def set_model(call):
 @bot.message_handler(commands=['image_model'])
 def choose_image_model(message):
     keyboard = types.InlineKeyboardMarkup()
-    current_model = user_image_models.get(message.from_user.id, DEFAULT_IMAGE_MODEL)
+    current_model = user_image_models.get(message.from_user.id, Config.DEFAULT_IMAGE_MODEL)
 
-    for name, model_id in AVAILABLE_IMAGE_MODELS.items():
+    for name, model_id in Config.AVAILABLE_IMAGE_MODELS.items():
         button_text = f"✅ {name}" if model_id == current_model else name
         keyboard.add(types.InlineKeyboardButton(
             text=button_text,
@@ -327,7 +300,7 @@ def set_image_model(call):
     model_id = call.data.split(":")[1]
     user_image_models[call.from_user.id] = model_id
 
-    model_name = next((name for name, mid in AVAILABLE_IMAGE_MODELS.items() if mid == model_id), model_id)
+    model_name = next((name for name, mid in Config.AVAILABLE_IMAGE_MODELS.items() if mid == model_id), model_id)
 
     bot.answer_callback_query(call.id, f"Модель изображений выбрана: {model_name}")
     bot.edit_message_text(
@@ -342,8 +315,8 @@ def set_image_model(call):
 @bot.message_handler(commands=['image_settings'])
 def image_settings_command(message):
     user_id = message.from_user.id
-    current_model = user_image_models.get(user_id, DEFAULT_IMAGE_MODEL)
-    settings = IMAGE_MODEL_SETTINGS.get(current_model)
+    current_model = user_image_models.get(user_id, Config.DEFAULT_IMAGE_MODEL)
+    settings = Config.IMAGE_MODEL_SETTINGS.get(current_model)
     current_size = user_image_settings.get(user_id, {}).get('size', settings['default_size'])
 
     keyboard = types.InlineKeyboardMarkup()
@@ -389,10 +362,8 @@ def set_image_size(call):
 
 # ===== ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ =====
 def generate_image_thread(message, raw_mode=False):
-    # Видаляємо команду /image або /image_raw
     prompt = message.text.replace("/image", "").replace("/image_raw", "").strip()
 
-    # Перевіряємо, чи користувач додав --raw в кінці (навіть для /image)
     if prompt.endswith("--raw"):
         raw_mode = True
         prompt = prompt.replace("--raw", "").strip()
@@ -402,41 +373,28 @@ def generate_image_thread(message, raw_mode=False):
             message,
             "❌ Напиши описание после команды\n\n"
             "📝 Пример: `/image красивый закат на море`\n"
-            "📝 Пример без улучшений: `/image_raw sunset` або `/image sunset --raw`\n\n"
-            "💡 *Советы для лучшего результата:*\n"
-            "• Используй описательные прилагательные\n"
-            "• Укажи стиль (реалистичный, аниме, акварель)\n"
-            "• Добавь детали освещения и настроения\n"
-            "• Пиши на английском для лучшего результата\n\n"
-            "🎨 Примеры хороших промптов:\n"
-            "`/image a serene mountain landscape at sunset, photorealistic`\n"
-            "`/image anime girl with blue hair, studio ghibli style`\n"
-            "`/image futuristic city with neon lights, cyberpunk`",
-            parse_mode= None
+            "📝 Пример без улучшений: `/image_raw sunset` или `/image sunset --raw`",
+            parse_mode="Markdown"
         )
         return
 
     user_id = message.from_user.id
-    model = user_image_models.get(user_id, DEFAULT_IMAGE_MODEL)
-    settings = IMAGE_MODEL_SETTINGS.get(model, IMAGE_MODEL_SETTINGS["flux"])
-
+    model = user_image_models.get(user_id, Config.DEFAULT_IMAGE_MODEL)
+    settings = Config.IMAGE_MODEL_SETTINGS.get(model, Config.IMAGE_MODEL_SETTINGS["flux"])
     user_size = user_image_settings.get(user_id, {}).get('size', settings.get('default_size', '1024x1024'))
 
-    # --- ПОКРАЩЕННЯ ПРОМПТУ ---
     if raw_mode:
         final_prompt = prompt
-        logging.info(f"Raw mode: промпт без изменений: {final_prompt}")
+        logging.info(f"Raw mode: {final_prompt}")
     else:
         final_prompt = improve_prompt(prompt, model)
-        logging.info(f"Оригинальный промпт: {prompt}")
-        logging.info(f"Улучшенный промпт: {final_prompt}")
+        logging.info(f"Original: {prompt} -> Enhanced: {final_prompt}")
 
     status_msg = bot.send_message(
         message.chat.id,
         f"🎨 Генерирую изображение...\n"
         f"📷 Модель: *{settings['name']}*\n"
-        f"📐 Размер: *{user_size}*\n"
-        f"✨ {'Промпт улучшен' if not raw_mode else 'Без улучшений'}...",
+        f"📐 Размер: *{user_size}*",
         parse_mode="Markdown"
     )
     bot.send_chat_action(message.chat.id, "upload_photo")
@@ -453,22 +411,18 @@ def generate_image_thread(message, raw_mode=False):
         if settings.get("supports_quality"):
             generation_params["quality"] = settings.get("quality", "hd")
 
-        # Тут можна додати negative_prompt, якщо модель підтримує
-        # generation_params["negative_prompt"] = "ugly, deformed, blurry, low quality"
-
-        logging.info(f"Параметры генерации: {generation_params}")
+        logging.info(f"Generation params: {generation_params}")
 
         response = client.images.generate(**generation_params)
         image_url = response.data[0].url
-        logging.info(f"Image URL: {image_url}")
 
         bot.edit_message_text(
-            f"🎨 Генерация завершена!\n📥 Скачиваю изображение...",
+            f"📥 Скачиваю изображение...",
             message.chat.id,
             status_msg.message_id
         )
 
-        img_response = requests.get(image_url, timeout=60)
+        img_response = requests.get(image_url, timeout=Config.REQUEST_TIMEOUT)
         img_response.raise_for_status()
         image_bytes = BytesIO(img_response.content)
         image_bytes.name = "image.png"
@@ -482,60 +436,43 @@ def generate_image_thread(message, raw_mode=False):
         )
         if not raw_mode:
             caption += "\n✨ *Автоулучшение:* включено"
-        if generation_params.get('quality'):
-            caption += f"\n💎 *Качество:* {generation_params['quality']}"
 
-        bot.send_photo(
-            message.chat.id,
-            image_bytes,
-            caption=caption,
-            parse_mode="Markdown"
-        )
+        bot.send_photo(message.chat.id, image_bytes, caption=caption, parse_mode="Markdown")
 
-        # Кнопки действий
+        # Обновляем статистику
+        update_stats(user_id, 'images_generated')
+
         keyboard = types.InlineKeyboardMarkup()
         keyboard.row(
             types.InlineKeyboardButton("🔄 Регенерировать", callback_data=f"regen:{prompt}:{raw_mode}"),
-            types.InlineKeyboardButton("✏️ Изменить промпт", callback_data="edit_prompt")
-        )
-        keyboard.row(
             types.InlineKeyboardButton("🎨 Сменить модель", callback_data="quick_model_change")
         )
-        bot.send_message(
-            message.chat.id,
-            "💡 Что дальше?",
-            reply_markup=keyboard
-        )
+        bot.send_message(message.chat.id, "💡 Что дальше?", reply_markup=keyboard)
 
     except Exception as e:
-        logging.error(f"Ошибка генерации изображения ({model}): {e}")
-        # ... (тут залишаємо твою логіку fallback, вона не змінилась)
+        logging.error(f"Ошибка генерации ({model}): {e}")
+
         fallback_models = ["flux", "dalle-3", "sdxl", "playground-v2.5"]
         fallback_models = [m for m in fallback_models if m != model]
 
         for fallback in fallback_models:
             try:
-                logging.info(f"Пробую запасную модель: {fallback}")
-                fallback_settings = IMAGE_MODEL_SETTINGS.get(fallback)
+                logging.info(f"Trying fallback: {fallback}")
+                fallback_settings = Config.IMAGE_MODEL_SETTINGS.get(fallback)
 
                 bot.edit_message_text(
-                    f"⚠️ Основная модель недоступна\n"
-                    f"🔄 Пробую: {fallback_settings['name']}...",
+                    f"⚠️ Пробую резервную модель: {fallback_settings['name']}...",
                     message.chat.id,
                     status_msg.message_id
                 )
 
-                # Для fallback теж застосовуємо покращення, якщо не raw_mode
-                if raw_mode:
-                    fallback_prompt = prompt
-                else:
-                    fallback_prompt = improve_prompt(prompt, fallback)
-
+                fallback_prompt = prompt if raw_mode else improve_prompt(prompt, fallback)
                 fallback_params = {
                     "model": fallback,
                     "prompt": fallback_prompt,
                     "response_format": "url"
                 }
+
                 if fallback_settings.get("supports_size"):
                     fallback_params["size"] = user_size
                 if fallback_settings.get("supports_quality"):
@@ -544,7 +481,7 @@ def generate_image_thread(message, raw_mode=False):
                 response = client.images.generate(**fallback_params)
                 image_url = response.data[0].url
 
-                img_response = requests.get(image_url, timeout=60)
+                img_response = requests.get(image_url, timeout=Config.REQUEST_TIMEOUT)
                 img_response.raise_for_status()
                 image_bytes = BytesIO(img_response.content)
                 image_bytes.name = "image.png"
@@ -553,49 +490,33 @@ def generate_image_thread(message, raw_mode=False):
 
                 caption = (
                     f"🎨 *Промпт:* {prompt}\n"
-                    f"📷 *Модель:* {fallback_settings['name']} (запасная)\n"
+                    f"📷 *Модель:* {fallback_settings['name']} (резервная)\n"
                     f"📐 *Размер:* {fallback_params.get('size', 'авто')}"
                 )
-                if not raw_mode:
-                    caption += "\n✨ *Автоулучшение:* включено"
 
-                bot.send_photo(
-                    message.chat.id,
-                    image_bytes,
-                    caption=caption,
-                    parse_mode="Markdown"
-                )
-
-                keyboard = types.InlineKeyboardMarkup()
-                keyboard.row(
-                    types.InlineKeyboardButton("🔄 Регенерировать", callback_data=f"regen:{prompt}:{raw_mode}"),
-                    types.InlineKeyboardButton("🎨 Сменить модель", callback_data="quick_model_change")
-                )
-                bot.send_message(
-                    message.chat.id,
-                    "💡 Что дальше?",
-                    reply_markup=keyboard
-                )
+                bot.send_photo(message.chat.id, image_bytes, caption=caption, parse_mode="Markdown")
+                update_stats(user_id, 'images_generated')
                 return
 
             except Exception as fallback_error:
-                logging.error(f"Запасная модель {fallback} не сработала: {fallback_error}")
+                logging.error(f"Fallback {fallback} failed: {fallback_error}")
                 continue
 
-        # Если все модели не сработали
-        bot.edit_message_text(
-            f"❌ *Ошибка генерации изображения*\n\n"
-            f"Причина: {str(e)[:200]}\n\n"
-            f"💡 *Попробуйте:*\n"
-            f"• Переформулировать описание\n"
-            f"• Использовать английский язык\n"
-            f"• Сменить модель через /image_model\n"
-            f"• Упростить запрос\n"
-            f"• Попробовать позже",
-            message.chat.id,
-            status_msg.message_id,
-            parse_mode="Markdown"
-        )
+        try:
+            bot.edit_message_text(
+                "❌ Ошибка генерации изображения\n\n"
+                "Все модели недоступны. Попробуйте:\n"
+                "• Сменить модель через /image_model\n"
+                "• Попробовать позже\n"
+                "• Упростить описание",
+                message.chat.id,
+                status_msg.message_id
+            )
+        except:
+            bot.send_message(
+                message.chat.id,
+                "❌ Ошибка генерации. Попробуйте позже."
+            )
 
 
 @bot.message_handler(commands=['image'])
@@ -608,18 +529,13 @@ def handle_image_raw(message):
     threading.Thread(target=generate_image_thread, args=(message, True), daemon=True).start()
 
 
-# ===== CALLBACK ДЛЯ РЕГЕНЕРАЦИИ =====
 @bot.callback_query_handler(func=lambda call: call.data.startswith("regen:"))
 def regenerate_image(call):
     data = call.data.replace("regen:", "").split(":", 1)
-    if len(data) == 2:
-        prompt, raw_mode_str = data
-        raw_mode = raw_mode_str.lower() == "true"
-    else:
-        prompt = data[0]
-        raw_mode = False
+    prompt = data[0]
+    raw_mode = data[1].lower() == "true" if len(data) == 2 else False
 
-    bot.answer_callback_query(call.id, "🔄 Регенерирую изображение...")
+    bot.answer_callback_query(call.id, "🔄 Регенерирую...")
 
     class FakeMessage:
         def __init__(self, chat_id, text, user):
@@ -631,17 +547,6 @@ def regenerate_image(call):
     threading.Thread(target=generate_image_thread, args=(fake_msg, raw_mode), daemon=True).start()
 
 
-@bot.callback_query_handler(func=lambda call: call.data == "edit_prompt")
-def edit_prompt_callback(call):
-    bot.answer_callback_query(call.id, "✏️ Отправь новый промпт")
-    bot.send_message(
-        call.message.chat.id,
-        "✏️ Отправь новое описание для генерации изображения:\n\n"
-        "Используй формат: `/image описание` или `/image_raw описание`",
-        parse_mode="Markdown"
-    )
-
-
 @bot.callback_query_handler(func=lambda call: call.data == "quick_model_change")
 def quick_model_change(call):
     bot.answer_callback_query(call.id)
@@ -651,24 +556,11 @@ def quick_model_change(call):
 # ===== АНАЛИЗ ИЗОБРАЖЕНИЙ =====
 @bot.message_handler(commands=['analyze'])
 def analyze_command(message):
-    user_waiting_for_image[message.from_user.id] = {
-        'waiting': True,
-        'prompt': None
-    }
+    user_waiting_for_image[message.from_user.id] = {'waiting': True, 'prompt': None}
     bot.send_message(
         message.chat.id,
-        "📸 *Режим анализа изображений активирован*\n\n"
-        "Отправь мне фото для анализа.\n\n"
-        "🔍 *Варианты использования:*\n"
-        "• Просто отправь фото (я опишу что на нём)\n"
-        "• Добавь подпись к фото с вопросом\n\n"
-        "💡 *Примеры вопросов:*\n"
-        "• Что изображено на этом фото?\n"
-        "• Опиши детально\n"
-        "• Какие эмоции передаёт изображение?\n"
-        "• Есть ли на фото текст?\n"
-        "• Определи породу животного\n"
-        "• Что это за место?",
+        "📸 *Режим анализа активирован*\n\n"
+        "Отправь мне фото для анализа.",
         parse_mode="Markdown"
     )
 
@@ -680,29 +572,20 @@ def analyze_image_thread(message, photo, user_prompt=None):
 
         file_info = bot.get_file(photo.file_id)
         downloaded_file = bot.download_file(file_info.file_path)
-
         image_base64 = base64.b64encode(downloaded_file).decode('utf-8')
 
-        if user_prompt:
-            prompt = user_prompt
-        else:
-            prompt = "Опиши подробно что изображено на этом фото. Укажи основные объекты, цвета, настроение и детали."
+        prompt = user_prompt or "Опиши подробно что изображено на этом фото."
 
         response = client.chat.completions.create(
-            model=VISION_MODEL,
+            model=Config.VISION_MODEL,
             messages=[
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "text",
-                            "text": prompt
-                        },
+                        {"type": "text", "text": prompt},
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_base64}"
-                            }
+                            "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}
                         }
                     ]
                 }
@@ -710,10 +593,9 @@ def analyze_image_thread(message, photo, user_prompt=None):
         )
 
         analysis = response.choices[0].message.content
-
         bot.delete_message(message.chat.id, status_msg.message_id)
 
-        max_length = 4096
+        max_length = Config.MAX_MESSAGE_LENGTH
         if len(analysis) > max_length:
             for i in range(0, len(analysis), max_length):
                 bot.send_message(message.chat.id, analysis[i:i + max_length])
@@ -724,20 +606,19 @@ def analyze_image_thread(message, photo, user_prompt=None):
                 parse_mode="Markdown"
             )
 
+        # Обновляем статистику
+        update_stats(message.from_user.id, 'images_analyzed')
+
     except Exception as e:
-        logging.error(f"Ошибка анализа изображения: {e}")
+        logging.error(f"Ошибка анализа: {e}")
         try:
             bot.edit_message_text(
-                f"❌ Ошибка при анализе изображения:\n{str(e)[:300]}\n\n"
-                f"💡 Попробуйте отправить фото ещё раз или используйте другое изображение.",
+                f"❌ Ошибка при анализе изображения. Попробуйте ещё раз.",
                 message.chat.id,
                 status_msg.message_id
             )
         except:
-            bot.send_message(
-                message.chat.id,
-                f"❌ Ошибка при анализе изображения:\n{str(e)[:300]}"
-            )
+            bot.send_message(message.chat.id, "❌ Ошибка при анализе изображения.")
 
 
 @bot.message_handler(content_types=['photo'])
@@ -759,11 +640,7 @@ def handle_photo(message):
             types.InlineKeyboardButton("🔍 Анализировать", callback_data=f"analyze_photo:{photo.file_id}"),
             types.InlineKeyboardButton("❌ Отмена", callback_data="cancel_photo")
         )
-        bot.send_message(
-            message.chat.id,
-            "📸 Что сделать с этим фото?",
-            reply_markup=keyboard
-        )
+        bot.send_message(message.chat.id, "📸 Что сделать с этим фото?", reply_markup=keyboard)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("analyze_photo:"))
@@ -776,18 +653,8 @@ def analyze_photo_callback(call):
             self.file_id = file_id
 
     photo = PhotoObj(file_id)
-
-    threading.Thread(
-        target=analyze_image_thread,
-        args=(call.message, photo, None),
-        daemon=True
-    ).start()
-
-    bot.edit_message_text(
-        "🔍 Начинаю анализ изображения...",
-        call.message.chat.id,
-        call.message.message_id
-    )
+    threading.Thread(target=analyze_image_thread, args=(call.message, photo, None), daemon=True).start()
+    bot.edit_message_text("🔍 Начинаю анализ...", call.message.chat.id, call.message.message_id)
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "cancel_photo")
@@ -798,8 +665,7 @@ def cancel_photo(call):
 
 # ===== ОБЩЕНИЕ С ИИ =====
 def chat_thread(message):
-    model = user_models.get(message.from_user.id, DEFAULT_MODEL)
-
+    model = user_models.get(message.from_user.id, Config.DEFAULT_MODEL)
     bot.send_chat_action(message.chat.id, "typing")
 
     try:
@@ -810,7 +676,10 @@ def chat_thread(message):
         )
         text = response.choices[0].message.content
 
-        max_length = 4096
+        # Обновляем статистику
+        update_stats(message.from_user.id, 'messages')
+
+        max_length = Config.MAX_MESSAGE_LENGTH
         if len(text) > max_length:
             for i in range(0, len(text), max_length):
                 bot.send_message(message.chat.id, text[i:i + max_length])
@@ -821,8 +690,7 @@ def chat_thread(message):
         logging.error(f"Ошибка генерации текста: {e}")
         bot.send_message(
             message.chat.id,
-            f"❌ Ошибка при обработке запроса:\n{str(e)[:200]}\n\n"
-            f"💡 Попробуйте переформулировать вопрос или выбрать другую модель через /model"
+            f"❌ Ошибка при обработке запроса. Попробуйте позже или смените модель через /model"
         )
 
 
@@ -834,120 +702,92 @@ def handle_text(message):
 # ===== ИНСТРУКЦИЯ =====
 @bot.message_handler(commands=['help'])
 def show_help(message):
-    current_model = user_models.get(message.from_user.id, DEFAULT_MODEL)
-    current_image_model = user_image_models.get(message.from_user.id, DEFAULT_IMAGE_MODEL)
-    current_image_model_name = IMAGE_MODEL_SETTINGS.get(current_image_model, {}).get('name', current_image_model)
+    current_model = user_models.get(message.from_user.id, Config.DEFAULT_MODEL)
+    current_image_model = user_image_models.get(message.from_user.id, Config.DEFAULT_IMAGE_MODEL)
+    current_image_model_name = Config.IMAGE_MODEL_SETTINGS.get(current_image_model, {}).get('name', current_image_model)
     current_size = user_image_settings.get(message.from_user.id, {}).get('size', '1024x1024')
 
     help_text = f"""
-📖 *ИНСТРУКЦИЯ ПО ИСПОЛЬЗОВАНИЮ БОТА*
+📖 *ИНСТРУКЦИЯ ПО ИСПОЛЬЗОВАНИЮ*
 
-🤖 Я многофункциональный ИИ-бот с расширенными возможностями.
+🤖 Многофункциональный ИИ-бот
 
 ━━━━━━━━━━━━━━━━━━━━━━
 
 🗨️ *ГЕНЕРАЦИЯ ТЕКСТА*
-
-/model - выбрать модель для общения
+/model - выбрать модель
 
 *Доступные модели:*
-- GPT-4.1 - самая продвинутая модель
-- GPT-4o - быстрая и умная
-- GPT-4 - классическая версия
-- GPT-4o-mini - быстрые ответы
-- DeepSeek V3 - альтернативная модель
-
-*Использование:*
-Просто напиши любое сообщение, и я отвечу!
+• GPT-4.1 - самая продвинутая
+• GPT-4o - быстрая и умная
+• GPT-4 - классическая
+• GPT-4o-mini - быстрые ответы
+• DeepSeek V3 - альтернатива
 
 ━━━━━━━━━━━━━━━━━━━━━━
 
 🎨 *ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ*
+/image_model - выбрать модель
+/image_settings - настроить размер
+/image <описание> - сгенерировать
+/image_raw <описание> - без улучшений
 
-/image_model - выбрать модель для изображений
-/image_settings - настроить размер и качество
-/image <описание> - сгенерировать картинку (автоулучшение)
-/image_raw <описание> - сгенерировать без автоулучшения
-(также можно добавить `--raw` в конец обычного /image)
-
-*Доступные модели:*
-- Flux (рекомендуется) - высокое качество
-- DALL-E 3 - от OpenAI
-- Stable Diffusion XL - детализация
-- Playground v2.5 - креативность
-- Midjourney - художественный стиль
-
-*Доступные размеры:*
-- 1024x1024 (квадрат)
-- 1024x1792 (вертикаль)
-- 1792x1024 (горизонталь)
-- 512x512 (маленький)
-
-*Примеры:*
-`/image beautiful sunset over ocean`
-`/image_raw beautiful sunset over ocean` (без улучшений)
-
-*💡 Советы для лучшего результата:*
-- Пиши на английском
-- Добавляй детали и стиль
-- Укажи освещение и настроение
-- Будь конкретным
+*Модели:*
+• Flux (рекомендуется)
+• DALL-E 3
+• Stable Diffusion XL
+• Playground v2.5
+• Midjourney
 
 ━━━━━━━━━━━━━━━━━━━━━━
 
 🔍 *АНАЛИЗ ИЗОБРАЖЕНИЙ*
+/analyze - анализировать фото
 
-/analyze - активировать режим анализа
+━━━━━━━━━━━━━━━━━━━━━━
 
-*Использование:*
-1. Отправь команду /analyze
-2. Отправь фото
-3. Или добавь подпись с вопросом
-
-*Примеры вопросов:*
-- Что на этом фото?
-- Опиши детально
-- Какой это стиль?
-- Есть ли текст на изображении?
-- Определи породу животного
+📊 *СТАТИСТИКА*
+/stats - показать статистику
 
 ━━━━━━━━━━━━━━━━━━━━━━
 
 ⚙️ *ТЕКУЩИЕ НАСТРОЙКИ*
-
-✅ Модель для текста: `{current_model}`
-🎨 Модель для изображений: `{current_image_model_name}`
-📐 Размер изображений: `{current_size}`
-
-━━━━━━━━━━━━━━━━━━━━━━
-
-💡 *ДОПОЛНИТЕЛЬНЫЕ ВОЗМОЖНОСТИ*
-
-- Автоматическое улучшение промптов
-- Интеллектуальное определение темы, стиля, освещения, композиции
-- Режим "сырого" промпта (`--raw` или `/image_raw`)
-- Fallback на другие модели при ошибке
-- Кнопки быстрых действий
-- Регенерация изображений
-- История настроек для каждого пользователя
+✅ Текст: `{current_model}`
+🎨 Изображения: `{current_image_model_name}`
+📐 Размер: `{current_size}`
 
 ━━━━━━━━━━━━━━━━━━━━━━
 
-❓ Есть вопросы? Просто напиши мне!
+💡 Просто напиши мне сообщение!
 """
-    bot.send_message(message.chat.id, help_text, parse_mode=None)
+    bot.send_message(message.chat.id, help_text, parse_mode="Markdown")
+
+
+# ===== GRACEFUL SHUTDOWN =====
+def signal_handler(sig, frame):
+    """Обработка сигналов завершения"""
+    logging.info("🛑 Получен сигнал остановки")
+    logging.info("👋 Бот завершает работу...")
+    bot.stop_polling()
+    sys.exit(0)
 
 
 # ===== ЗАПУСК БОТА =====
 if __name__ == "__main__":
+    # Регистрация обработчиков сигналов
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     logging.info("=" * 50)
-    logging.info("🤖 Бот запущен и готов к работе! ")
-    logging.info("📋 Доступные команды загружены ")
-    logging.info("✅ Система улучшения промптов активирована")
+    logging.info("🤖 Бот запущен и готов к работе!")
+    logging.info("📋 Команды загружены")
+    logging.info("✅ Система улучшения промптов активна")
     logging.info("=" * 50)
+
     try:
         bot.polling(none_stop=True, interval=0, timeout=20)
     except KeyboardInterrupt:
         logging.info("Бот остановлен пользователем")
     except Exception as e:
         logging.error(f"Критическая ошибка: {e}")
+

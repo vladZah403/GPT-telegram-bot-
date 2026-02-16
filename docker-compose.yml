@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  telegram-bot:
+    build: .
+    container_name: telegram-ai-bot
+    env_file:
+      - .env
+    restart: unless-stopped
+    
+    # Логирование
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    # Переменные окружения (можно переопределить)
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DEFAULT_MODEL=${DEFAULT_MODEL:-gpt-4}
+      - DEFAULT_IMAGE_MODEL=${DEFAULT_IMAGE_MODEL:-flux}
+    
+    # Ограничение ресурсов (опционально)
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+    
+    # Health check (опционально)
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
